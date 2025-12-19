@@ -17,7 +17,7 @@ void hdkf_extract(uint8_t out[32], uint8_t *salt, size_t salt_size, uint8_t *key
 	EVP_KDF_free(kdf);
 }
 
-void hdkf_expand_label(uint8_t *out, size_t out_size, uint8_t key[32], char *label) {
+void hdkf_expand_label_with_extra(uint8_t *out, size_t out_size, uint8_t key[32], uint8_t *extra, size_t extra_len, char *label) {
 	char prefix[] = "tls13 ";
 	uint16_t prefix_len = sizeof(prefix) - 1;
 	uint16_t label_len = strlen(label);
@@ -25,12 +25,21 @@ void hdkf_expand_label(uint8_t *out, size_t out_size, uint8_t key[32], char *lab
 	uint16_t hash_len = htons(out_size);
 
 	int hkdf_label_len = 0;
-	char hkdf_label[80] = {};
+	char hkdf_label[514] = {};
+
+	// hash length
 	memcpy(hkdf_label + hkdf_label_len, &hash_len, sizeof(hash_len)); hkdf_label_len += sizeof(hash_len);
+
+	// label
 	memcpy(hkdf_label + hkdf_label_len, &full_label_len, sizeof(full_label_len)); hkdf_label_len += sizeof(full_label_len);
 	memcpy(hkdf_label + hkdf_label_len, prefix, prefix_len); hkdf_label_len += prefix_len;
 	memcpy(hkdf_label + hkdf_label_len, label,  label_len);  hkdf_label_len += label_len;
-	*(hkdf_label + hkdf_label_len) = 0; hkdf_label_len += 1;
+
+	// extra info
+	*(hkdf_label + hkdf_label_len) = extra_len; hkdf_label_len += 1;
+	memcpy(hkdf_label + hkdf_label_len, extra, extra_len); hkdf_label_len += extra_len;
+
+	// HMAC iteration counter - always 1
 	*(hkdf_label + hkdf_label_len) = 1; hkdf_label_len += 1;
 
 	uint8_t out_buf[32] = {};
@@ -41,14 +50,18 @@ void hdkf_expand_label(uint8_t *out, size_t out_size, uint8_t key[32], char *lab
 	memcpy(out, out_buf, out_size);
 }
 
-void encrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr) {
+void hdkf_expand_label(uint8_t *out, size_t out_size, uint8_t key[32], char *label) {
+	hdkf_expand_label_with_extra(out, out_size, key, NULL, 0, label);
+}
+
+void encrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr, size_t hdr_size) {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 	EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL);
 	EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);
 
 	int byte_count = 0;
-	EVP_EncryptUpdate(ctx, NULL, &byte_count, pkt_hdr, 24);
+	EVP_EncryptUpdate(ctx, NULL, &byte_count, pkt_hdr, hdr_size);
 	EVP_EncryptUpdate(ctx, out_buffer, &byte_count, buffer, buffer_size);
 	EVP_EncryptFinal_ex(ctx, out_buffer + byte_count, &byte_count);
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, aead);
@@ -77,7 +90,23 @@ void generate_public_key(uint8_t private_key[32], uint8_t public_key[32]) {
 	EVP_PKEY_free(pkey);
 }
 
-bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr) {
+void generate_shared_secret(uint8_t private_key[32], uint8_t public_key[32], uint8_t result[32]) {
+	EVP_PKEY *priv_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, private_key, 32);
+	EVP_PKEY *pub_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, public_key, 32);
+	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv_key, NULL);
+	EVP_PKEY_derive_init(ctx);
+	EVP_PKEY_derive_set_peer(ctx, pub_key);
+
+
+	size_t len = 32;
+	EVP_PKEY_derive(ctx, result, &len);
+
+	EVP_PKEY_CTX_free(ctx);
+	EVP_PKEY_free(priv_key);
+	EVP_PKEY_free(pub_key);
+}
+
+bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr, size_t hdr_size) {
 	//return crypto_aead_aes256gcm_decrypt_detached(out_buffer, NULL, buffer, buffer_size, aead, NULL, 0, nonce, key) == 0;
 
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -86,7 +115,7 @@ bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, ui
 	EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv);
 
 	int byte_count = 0;
-	EVP_DecryptUpdate(ctx, NULL, &byte_count, pkt_hdr, 21);
+	EVP_DecryptUpdate(ctx, NULL, &byte_count, pkt_hdr, hdr_size);
 	EVP_DecryptUpdate(ctx, out_buffer, &byte_count, buffer, buffer_size);
 
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, aead);
@@ -96,4 +125,20 @@ bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, ui
 	EVP_CIPHER_CTX_free(ctx);
 
 	return final > 0;
+}
+
+EVP_MD_CTX *init_sha256(void) {
+	EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
+	return mdctx;
+}
+
+void update_sha256_sum(EVP_MD_CTX *mdctx, uint8_t *buffer, size_t buffer_size) {
+	EVP_DigestUpdate(mdctx, buffer, buffer_size);
+}
+
+void finish_sha256_sum(EVP_MD_CTX *mdctx, uint8_t hash[32]) {
+	uint32_t hash_len = 32;
+	EVP_DigestFinal_ex(mdctx, hash, &hash_len);
+	EVP_MD_CTX_free(mdctx);
 }

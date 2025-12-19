@@ -1,3 +1,6 @@
 localhost {
+	tls {
+		insecure_secrets_log /tmp/sslkey.log
+	}
 	respond "Hello, world!"
 }

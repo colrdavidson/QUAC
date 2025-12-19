@@ -21,14 +21,27 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ELEM_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-void dump_bytes(uint8_t *bytes, size_t len) {
+void dump_bytes_width(uint8_t *bytes, size_t len, int width) {
 	for (int i = 0; i < len; i++) {
 		printf("%02x", bytes[i]);
 		if (i + 1 < len) {
 			printf(" ");
 		}
-		if (i + 1 == len || (i > 0 && (i + 1) % 25 == 0)) {
+		if (i + 1 == len || (i > 0 && (i + 1) % width == 0)) {
 			printf("\n");
+		}
+	}
+}
+
+void dump_bytes(uint8_t *bytes, size_t len) {
+	dump_bytes_width(bytes, len, 25);
+}
+
+void dump_flat_bytes(uint8_t *bytes, size_t len) {
+	for (int i = 0; i < len; i++) {
+		printf("%02x", bytes[i]);
+		if (i + 1 == len) {
+			printf(" ");
 		}
 	}
 }
@@ -40,6 +53,13 @@ uint8_t initial_salt[] = {
 	0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d,
 	0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb,
 	0x7f, 0x0a
+};
+
+uint8_t empty_sha256_hash[32] = {
+	0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a,
+	0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae,
+	0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99,
+	0x1b, 0x78, 0x52, 0xb8, 0x55
 };
 
 enum {
@@ -189,6 +209,7 @@ char *quic_packet_longtype_to_str(QUIC_Packet_LongType x) {
 }
 #undef X
 
+
 typedef struct {
 	char *hostname;
 	uint64_t hostname_len;
@@ -200,6 +221,7 @@ typedef struct {
 	uint64_t dst_id_len;
 
 	uint8_t client_rand[32];
+	uint8_t server_rand[32];
 
 	uint8_t client_private_key[32];
 	uint8_t client_public_key[32];
@@ -211,16 +233,139 @@ typedef struct {
 	uint8_t client_secret[32];
 	uint8_t client_key[16];
 	uint8_t client_iv[12];
-	uint8_t client_hp_key[16];
+	uint8_t client_hp[16];
 
 	uint8_t server_secret[32];
 	uint8_t server_key[16];
 	uint8_t server_iv[12];
-	uint8_t server_hp_key[16];
+	uint8_t server_hp[16];
 
 	uint8_t client_nonce[12];
 	uint8_t server_nonce[12];
+
+	EVP_MD_CTX *mdctx;
+	uint8_t hello_hash[32];
+
+	uint8_t client_handshake_key[16];
+	uint8_t client_handshake_iv[12];
+	uint8_t client_handshake_hp[16];
+
+	uint8_t server_handshake_key[16];
+	uint8_t server_handshake_iv[12];
+	uint8_t server_handshake_hp[16];
 } Conn_Info;
+
+bool gen_initial_keys(Conn_Info *ci_out, char *hostname, uint8_t *dst_id, int dst_id_len, uint8_t *src_id, int src_id_len) {
+	Conn_Info ci = {};
+
+	ci.dst_id = dst_id;
+	ci.dst_id_len = dst_id_len;
+
+	ci.src_id = src_id;
+	ci.src_id_len = src_id_len;
+
+	int hostname_len = strlen(hostname);
+	ci.hostname = hostname;
+	ci.hostname_len = hostname_len;
+
+	for (int i = 0; i < sizeof(ci.client_rand); i++) {
+		ci.client_rand[i] = i;
+	}
+	for (int i = 0; i < 32; i++) {
+		ci.client_private_key[i] = i + 0x20;
+	}
+	generate_public_key(ci.client_private_key, ci.client_public_key);
+
+	uint8_t initial_rand[8] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+
+	char client_secret_label[] = "client in";
+	char server_secret_label[] = "server in";
+	char key_label[]           = "quic key";
+	char iv_label[]            = "quic iv";
+	char hp_label[]            = "quic hp";
+
+	hdkf_extract(ci.initial_secret, initial_salt, sizeof(initial_salt), initial_rand, sizeof(initial_rand));
+
+	hdkf_expand_label(ci.client_secret, sizeof(ci.client_secret), ci.initial_secret, client_secret_label);
+	hdkf_expand_label(ci.client_key,    sizeof(ci.client_key),    ci.client_secret,  key_label);
+	hdkf_expand_label(ci.client_iv,     sizeof(ci.client_iv),     ci.client_secret,  iv_label);
+	hdkf_expand_label(ci.client_hp,     sizeof(ci.client_hp),     ci.client_secret,  hp_label);
+
+	hdkf_expand_label(ci.server_secret, sizeof(ci.server_secret), ci.initial_secret, server_secret_label);
+	hdkf_expand_label(ci.server_key,    sizeof(ci.server_key),    ci.server_secret,  key_label);
+	hdkf_expand_label(ci.server_iv,     sizeof(ci.server_iv),     ci.server_secret,  iv_label);
+	hdkf_expand_label(ci.server_hp,     sizeof(ci.server_hp),     ci.server_secret,  hp_label);
+
+	ci.mdctx = init_sha256();
+
+	*ci_out = ci;
+	return true;
+}
+
+bool gen_handshake_keys(Conn_Info *ci) {
+/*
+	uint8_t tmp_srv_pubkey[32] = {
+		0x9f, 0xd7, 0xad, 0x6d, 0xcf, 0xf4,
+		0x29, 0x8d, 0xd3, 0xf9, 0x6d, 0x5b,
+		0x1b, 0x2a, 0xf9, 0x10, 0xa0, 0x53,
+		0x5b, 0x14, 0x88, 0xd7, 0xf8, 0xfa,
+		0xbb, 0x34, 0x9a, 0x98, 0x28, 0x80,
+		0xb6, 0x15
+	};
+
+*/
+	finish_sha256_sum(ci->mdctx, ci->hello_hash);
+
+	uint8_t zero_key[32] = {};
+	uint8_t blank_salt[1] = {};
+
+	uint8_t early_secret[32];
+	uint8_t derived_secret[32];
+	uint8_t shared_secret[32];
+	uint8_t handshake_secret[32];
+
+	uint8_t client_secret[32];
+	uint8_t server_secret[32];
+
+	char derived_label[]       = "derived";
+	char client_secret_label[] = "c hs traffic";
+	char server_secret_label[] = "s hs traffic";
+	char key_label[]           = "quic key";
+	char iv_label[]            = "quic iv";
+	char hp_label[]            = "quic hp";
+
+	hdkf_extract(early_secret, blank_salt, sizeof(blank_salt), zero_key, sizeof(zero_key));
+	hdkf_expand_label_with_extra(derived_secret, sizeof(derived_secret), early_secret, empty_sha256_hash, sizeof(empty_sha256_hash), derived_label);
+
+	generate_shared_secret(ci->client_private_key, ci->server_public_key, shared_secret);
+	hdkf_extract(handshake_secret, derived_secret, sizeof(derived_secret), shared_secret, sizeof(shared_secret));
+
+	hdkf_expand_label_with_extra(client_secret, sizeof(client_secret), handshake_secret, ci->hello_hash, sizeof(ci->hello_hash), client_secret_label);
+/*
+	printf("CLIENT_HANDSHAKE_TRAFFIC_SECRET ");
+	dump_flat_bytes(ci->client_rand, sizeof(ci->client_rand));
+	dump_flat_bytes(client_secret, sizeof(client_secret));
+	printf("\n");
+*/
+
+	hdkf_expand_label(ci->client_handshake_key, sizeof(ci->client_handshake_key), client_secret, key_label);
+	hdkf_expand_label(ci->client_handshake_iv,  sizeof(ci->client_handshake_iv),  client_secret, iv_label);
+	hdkf_expand_label(ci->client_handshake_hp,  sizeof(ci->client_handshake_hp),  client_secret, hp_label);
+
+	hdkf_expand_label_with_extra(server_secret, sizeof(server_secret), handshake_secret, ci->hello_hash, sizeof(ci->hello_hash), server_secret_label);
+/*
+	printf("SERVER_HANDSHAKE_TRAFFIC_SECRET ");
+	dump_flat_bytes(ci->client_rand, sizeof(ci->client_rand));
+	dump_flat_bytes(server_secret, sizeof(server_secret));
+	printf("\n");
+*/
+
+	hdkf_expand_label(ci->server_handshake_key, sizeof(ci->server_handshake_key), server_secret, key_label);
+	hdkf_expand_label(ci->server_handshake_iv,  sizeof(ci->server_handshake_iv),  server_secret, iv_label);
+	hdkf_expand_label(ci->server_handshake_hp,  sizeof(ci->server_handshake_hp),  server_secret, hp_label);
+	
+	return true;
+}
 
 int build_client_hello(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	Slice s = {.data = buffer, .len = 0, .cap = buffer_size};
@@ -446,7 +591,7 @@ bool parse_tls_server_hello(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) 
 			case Extension_SupportedVersions: {
 				uint16_t version = read_u16_be(&s);
 				if (version != 0x0304) {
-					printf("Server doesn't support TLS 1.3!\n");
+					printf("Server doesn't support TLS 1.3! Got %x\n", version);
 					return false;
 				}
 			} break;
@@ -468,6 +613,7 @@ bool parse_tls_server_hello(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) 
 		}
 	}
 
+	memcpy(ci->server_rand, server_rand, 32);
 	return true;
 }
 
@@ -479,16 +625,17 @@ int build_initial_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	// Build TLS Client Hello
 	uint8_t client_hello[1500] = {};
 	int64_t client_hello_size = build_client_hello(ci, client_hello, sizeof(client_hello));
+	update_sha256_sum(ci->mdctx, client_hello, client_hello_size);
 
-	uint8_t pkt_hdr = 0;
-	pkt_hdr |= 1 << 7; // form
-	pkt_hdr |= 1 << 6; // fixed
-	pkt_hdr |= 0 << 4; // type
-	pkt_hdr |= 0 << 2; // reserved
-	pkt_hdr |= 0 << 0; // packet num length
+	uint8_t pkt_hdr_byte = 0;
+	pkt_hdr_byte |= 1 << 7; // form
+	pkt_hdr_byte |= 1 << 6; // fixed
+	pkt_hdr_byte |= 0 << 4; // type
+	pkt_hdr_byte |= 0 << 2; // reserved
+	pkt_hdr_byte |= 0 << 0; // packet num length
 
 	// Packet Header
-	write_u8(&s, pkt_hdr);
+	write_u8(&s, pkt_hdr_byte);
 
 	// Packet Version
 	write_u32_be(&s, 0x1);
@@ -519,12 +666,15 @@ int build_initial_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	uint64_t pkt_num_start = s.len;
 	write_u8(&s, 0);
 
+	uint8_t *pkt_hdr = s.data;
+	uint64_t pkt_hdr_size = s.len;
+
 	// Add encrypted payload
 	uint8_t encrypted_data[1600] = {};
 	uint8_t aead_bytes[16] = {};
 	encrypt_buffer(encrypted_data,
 		cf.data, cf.len,
-		ci->client_key, ci->client_iv, aead_bytes, ci->client_nonce, s.data
+		ci->client_key, ci->client_iv, aead_bytes, ci->client_nonce, pkt_hdr, pkt_hdr_size
 	);
 	write_data(&s, encrypted_data, cf.len);
 	write_data(&s, aead_bytes, aead_len);
@@ -532,7 +682,7 @@ int build_initial_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	// Generate payload mask for header protection
 	uint8_t payload_mask[16] = {};
 	uint8_t *sample = s.data + pkt_num_start + 4;
-	generate_mask(payload_mask, sample, ci->client_hp_key);
+	generate_mask(payload_mask, sample, ci->client_hp);
 
 	// add header protection to second half of header byte
 	s.data[0] = s.data[0] ^ (payload_mask[0] & 0x0F);
@@ -548,58 +698,60 @@ int build_initial_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uint8_t *plaintext_buffer, uint64_t *plaintext_size) {
 	Slice s = {.data = buffer, .len = 0, .cap = buffer_size};
 
-	uint8_t pkt_hdr = read_u8(&s);
-	uint8_t hdr_form  = (pkt_hdr & 0x80) >> 7;
-	uint8_t fixed_bit = (pkt_hdr & 0x40) >> 6;
-	uint8_t pkt_type  = (pkt_hdr & 0x30) >> 4;
+	uint8_t pkt_hdr_byte = read_u8(&s);
+	uint8_t hdr_form  = (pkt_hdr_byte & 0x80) >> 7;
+	uint8_t fixed_bit = (pkt_hdr_byte & 0x40) >> 6;
+	uint8_t pkt_type  = (pkt_hdr_byte & 0x30) >> 4;
 
-	printf("pkt %x | is long: %u, fixed: %u, type: (%u) %s\n", pkt_hdr, hdr_form, fixed_bit, pkt_type, quic_packet_longtype_to_str(pkt_type));
+	printf("pkt %x | is long: %u, fixed: %u, type: (%u) %s\n", pkt_hdr_byte, hdr_form, fixed_bit, pkt_type, quic_packet_longtype_to_str(pkt_type));
 
+	uint8_t payload_mask[16] = {};
 	uint64_t pkt_len = 0;
+
+	uint8_t *server_hp;
+	uint8_t *server_key;
+	uint8_t *server_iv;
+
+	uint32_t quic_version = read_u32_be(&s);
+
+	uint8_t dst_id_len = read_u8(&s);
+	uint8_t *dst_id = read_data(&s, dst_id_len);
+
+	uint8_t src_id_len = read_u8(&s);
+	uint8_t *src_id = read_data(&s, src_id_len);
+
 	switch ((QUIC_Packet_LongType)pkt_type) {
 		case LongType_Initial: {
-			uint32_t quic_version = read_u32_be(&s);
-
-			uint8_t dst_id_len = read_u8(&s);
-			uint8_t *dst_id = read_data(&s, dst_id_len);
-
-			uint8_t src_id_len = read_u8(&s);
-			uint8_t *src_id = read_data(&s, src_id_len);
-
 			// Skip token
 			uint8_t token = read_u8(&s);
 
 			pkt_len = read_varint(&s);
+
+			server_hp  = ci->server_hp;
+			server_key = ci->server_key;
+			server_iv  = ci->server_iv;
 		} break;
 		case LongType_Handshake: {
-			uint32_t quic_version = read_u32_be(&s);
-
-			uint8_t dst_id_len = read_u8(&s);
-			uint8_t *dst_id = read_data(&s, dst_id_len);
-
-			uint8_t src_id_len = read_u8(&s);
-			uint8_t *src_id = read_data(&s, src_id_len);
-
 			pkt_len = read_varint(&s);
 
-			gen_handshake_keys(ci);
+			server_hp  = ci->server_handshake_hp;
+			server_key = ci->server_handshake_key;
+			server_iv  = ci->server_handshake_iv;
 		} break;
 		default: {
-			printf("unhandled packet type (hdr: %x) %s\n", pkt_hdr, quic_packet_longtype_to_str(pkt_type));
+			printf("unhandled packet type (hdr: %x) %s\n", pkt_hdr_byte, quic_packet_longtype_to_str(pkt_type));
 			return 0;
 		}
 	}
 
-	uint8_t payload_mask[16] = {};
 	uint8_t *sample = s.data + s.len + 4;
-	generate_mask(payload_mask, sample, ci->server_hp_key);
+	generate_mask(payload_mask, sample, server_hp);
 
 	// unprotect packet header
 	s.data[0] = s.data[0] ^ (payload_mask[0] & 0x0F);
-	pkt_hdr = s.data[0];
+	pkt_hdr_byte = s.data[0];
 
-	uint64_t pkt_num_len = ((uint64_t)1ull) << (pkt_hdr & 0x03);
-
+	uint64_t pkt_num_len = ((uint64_t)1ull) << (pkt_hdr_byte & 0x03);
 	uint64_t pkt_num_start = s.len;
 
 	// Skip packet number
@@ -610,13 +762,16 @@ int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uin
 		*(s.data + pkt_num_start + i) ^= payload_mask[i+1];
 	}
 
+	uint8_t *pkt_hdr = s.data;
+	uint64_t pkt_hdr_size = s.len;
+
 	uint64_t aead_len = 16;
 	uint64_t encrypted_size = pkt_len - pkt_num_len - aead_len;
 	uint8_t *encrypted_buffer = read_data(&s, encrypted_size);
 
 	uint8_t *aead = read_data(&s, aead_len);
 
-	if (!decrypt_buffer(plaintext_buffer, encrypted_buffer, encrypted_size, ci->server_key, ci->server_iv, aead, ci->server_nonce, s.data)) {
+	if (!decrypt_buffer(plaintext_buffer, encrypted_buffer, encrypted_size, server_key, server_iv, aead, ci->server_nonce, pkt_hdr, pkt_hdr_size)) {
 		printf("failed to decrypt server packet!\n");
 		return 0;
 	}
@@ -631,7 +786,6 @@ bool parse_server_frames(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	while (pt.len < pt.cap) {
 		uint8_t frame_type_byte = read_u8(&pt);
 		QUIC_Frame_Type frame_type = (QUIC_Frame_Type)frame_type_byte;
-
 		switch (frame_type) {
 			case Frame_ConnectionClose_QUIC: {
 				printf("Connection closed?\n");
@@ -659,18 +813,28 @@ bool parse_server_frames(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 				uint64_t offset = read_varint(&pt);
 				uint64_t size   = read_varint(&pt);
 
-				uint8_t msg_type = read_u8(&pt);
-				uint32_t msg_size = read_u24_be(&pt);
+				uint64_t crypto_frame_start = pt.len;
 
-				if (msg_type != 0x02) {
+				uint8_t tls_msg_type = read_u8(&pt);
+				uint32_t tls_msg_size = read_u24_be(&pt);
+
+				uint64_t crypto_frame_end = crypto_frame_start + sizeof(uint32_t) + tls_msg_size;
+
+				if (tls_msg_type != 0x02) {
 					printf("unhandled TLS message!\n");
 					return false;
 				}
 
-				uint8_t *tls_data = read_data(&pt, msg_size);
-				if (!parse_tls_server_hello(ci, tls_data, msg_size)) {
+				uint8_t *server_hello = pt.data + crypto_frame_start;
+				uint64_t server_hello_size = crypto_frame_end - crypto_frame_start;
+				update_sha256_sum(ci->mdctx, server_hello, server_hello_size);
+
+				uint8_t *tls_data = read_data(&pt, tls_msg_size);
+				if (!parse_tls_server_hello(ci, tls_data, tls_msg_size)) {
 					return false;
 				}
+
+				gen_handshake_keys(ci);
 			} break;
 			default: {
 				printf("Unhandled frame type: (0x%x) %s\n", frame_type, quic_frame_type_to_str(frame_type));
@@ -682,53 +846,6 @@ bool parse_server_frames(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	return true;
 }
 
-bool gen_initial_keys(Conn_Info *ci_out, char *hostname, uint8_t *dst_id, int dst_id_len, uint8_t *src_id, int src_id_len) {
-	Conn_Info ci = {};
-
-	ci.dst_id = dst_id;
-	ci.dst_id_len = dst_id_len;
-
-	ci.src_id = src_id;
-	ci.src_id_len = src_id_len;
-
-	int hostname_len = strlen(hostname);
-	ci.hostname = hostname;
-	ci.hostname_len = hostname_len;
-
-	for (int i = 0; i < sizeof(ci.client_rand); i++) {
-		ci.client_rand[i] = i;
-	}
-	for (int i = 0; i < 32; i++) {
-		ci.client_private_key[i] = i + 0x20;
-	}
-	generate_public_key(ci.client_private_key, ci.client_public_key);
-
-	uint8_t initial_rand[8] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
-
-	char client_secret_label[] = "client in";
-	char server_secret_label[] = "server in";
-	char key_label[]           = "quic key";
-	char iv_label[]            = "quic iv";
-	char hp_label[]            = "quic hp";
-
-	hdkf_extract(ci.initial_secret, initial_salt, sizeof(initial_salt), initial_rand, sizeof(initial_rand));
-
-	hdkf_expand_label(ci.client_secret, sizeof(ci.client_secret), ci.initial_secret, client_secret_label);
-	hdkf_expand_label(ci.client_key,    sizeof(ci.client_key),    ci.client_secret,  key_label);
-	hdkf_expand_label(ci.client_iv,     sizeof(ci.client_iv),     ci.client_secret,  iv_label);
-	hdkf_expand_label(ci.client_hp_key, sizeof(ci.client_hp_key), ci.client_secret,  hp_label);
-
-	hdkf_expand_label(ci.server_secret, sizeof(ci.server_secret), ci.initial_secret, server_secret_label);
-	hdkf_expand_label(ci.server_key,    sizeof(ci.server_key),    ci.server_secret,  key_label);
-	hdkf_expand_label(ci.server_iv,     sizeof(ci.server_iv),     ci.server_secret,  iv_label);
-	hdkf_expand_label(ci.server_hp_key, sizeof(ci.server_hp_key), ci.server_secret,  hp_label);
-
-	*ci_out = ci;
-	return true;
-}
-
-bool gen_handshake_keys(Conn_Info *ci) {
-}
 
 int main() {
 	int sd = socket(AF_INET6, SOCK_DGRAM, 0);
@@ -788,7 +905,7 @@ int main() {
 	uint8_t plaintext_buffer[1500] = {};
 	uint64_t plaintext_size = 0;
 	while (proc_size < recv_bytes) {
-		int ret = decode_server_packet(&ci, recv_buffer + proc_size, sizeof(recv_buffer) - proc_size, plaintext_buffer, &plaintext_size);
+		int ret = decode_server_packet(&ci, recv_buffer + proc_size, recv_bytes - proc_size, plaintext_buffer, &plaintext_size);
 		if (ret == 0) {
 			printf("failed to decode server packet!\n");
 			return 1;

@@ -7,7 +7,7 @@ typedef struct {
 } Slice;
 
 bool write_u8(Slice *s, uint8_t v) {
-	if (s->len + sizeof(v) >= s->cap) { return false; } 
+	if (s->len + sizeof(v) > s->cap) { return false; } 
 
 	*(s->data + s->len) = v;
 	s->len += sizeof(v);
@@ -15,7 +15,7 @@ bool write_u8(Slice *s, uint8_t v) {
 }
 
 bool write_u16_be(Slice *s, uint16_t v) {
-	if (s->len + sizeof(v) >= s->cap) { return false; } 
+	if (s->len + sizeof(v) > s->cap) { return false; } 
 
 	uint16_t be_v = htons(v);
 	memcpy(s->data + s->len, &be_v, sizeof(v));
@@ -24,7 +24,7 @@ bool write_u16_be(Slice *s, uint16_t v) {
 }
 
 bool write_u24_be(Slice *s, uint32_t v) {
-	if (s->len + 3 >= s->cap || v > 0xFFFFFF) { return false; }
+	if (s->len + 3 > s->cap || v > 0xFFFFFF) { return false; }
 
 	uint8_t be_v[3];
 	be_v[0] = v >> 16;
@@ -36,7 +36,7 @@ bool write_u24_be(Slice *s, uint32_t v) {
 }
 
 bool write_u32_be(Slice *s, uint32_t v) {
-	if (s->len + sizeof(v) >= s->cap) { return false; } 
+	if (s->len + sizeof(v) > s->cap) { return false; } 
 
 	uint32_t be_v = htonl(v);
 	memcpy(s->data + s->len, &be_v, sizeof(v));
@@ -45,7 +45,7 @@ bool write_u32_be(Slice *s, uint32_t v) {
 }
 
 bool write_u64_be(Slice *s, uint64_t v) {
-	if (s->len + sizeof(v) >= s->cap) { return false; } 
+	if (s->len + sizeof(v) > s->cap) { return false; } 
 
 	uint64_t be_v = htonll(v);
 	memcpy(s->data + s->len, &be_v, sizeof(v));
@@ -54,7 +54,7 @@ bool write_u64_be(Slice *s, uint64_t v) {
 }
 
 bool write_data(Slice *s, uint8_t *data, size_t data_len) {
-	if (s->len + data_len >= s->cap) { return false; } 
+	if (s->len + data_len > s->cap) { return false; } 
 
 	memcpy(s->data + s->len, data, data_len);
 	s->len += data_len;
@@ -117,7 +117,7 @@ bool write_varint(Slice *s, uint64_t v) {
 
 uint8_t read_u8(Slice *s) {
 	uint8_t out = 0;
-	if (s->len + sizeof(out) >= s->cap) {
+	if (s->len + sizeof(out) > s->cap) {
 		return 0;
 	}
 
@@ -128,7 +128,7 @@ uint8_t read_u8(Slice *s) {
 
 uint16_t read_u16_be(Slice *s) {
 	uint16_t out = 0;
-	if (s->len + sizeof(out) >= s->cap) {
+	if (s->len + sizeof(out) > s->cap) {
 		return 0;
 	}
 
@@ -138,7 +138,7 @@ uint16_t read_u16_be(Slice *s) {
 }
 
 uint32_t read_u24_be(Slice *s) {
-	if (s->len + 3 >= s->cap) { return 0; }
+	if (s->len + 3 > s->cap) { return 0; }
 
 	uint8_t be_v[3];
 	memcpy(be_v, s->data + s->len, 3);
@@ -150,7 +150,7 @@ uint32_t read_u24_be(Slice *s) {
 
 uint32_t read_u32_be(Slice *s) {
 	uint32_t out = 0;
-	if (s->len + sizeof(out) >= s->cap) {
+	if (s->len + sizeof(out) > s->cap) {
 		return 0;
 	}
 
@@ -161,7 +161,7 @@ uint32_t read_u32_be(Slice *s) {
 
 uint64_t read_u64_be(Slice *s) {
 	uint64_t out = 0;
-	if (s->len + sizeof(out) >= s->cap) {
+	if (s->len + sizeof(out) > s->cap) {
 		return 0;
 	}
 
@@ -182,7 +182,7 @@ uint8_t *read_data(Slice *s, uint64_t len) {
 
 uint64_t read_varint(Slice *s) {
 	// Check for space for tag bits
-	if (s->len + 1 >= s->cap) {
+	if (s->len + 1 > s->cap) {
 		return 0;
 	}
 
@@ -190,7 +190,7 @@ uint64_t read_varint(Slice *s) {
 	uint32_t len = ((uint32_t)1u) << ((first_byte & 0xC0) >> 6);
 
 	// Make sure we can read the whole value
-	if (s->len + len >= s->cap) {
+	if (s->len + len > s->cap) {
 		return 0;
 	}
 
