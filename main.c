@@ -92,16 +92,6 @@ enum {
 	X(LongType_Handshake,  2)   \
 	X(LongType_Retry,      3)
 
-#define TLS_EXTENSION_TYPE(X)              \
-	X(Extension_ServerName,          0x00) \
-	X(Extension_SupportedGroups,     0x0a) \
-	X(Extension_SignatureAlgorithms, 0x0d) \
-	X(Extension_ALPN,                0x10) \
-	X(Extension_SupportedVersions,   0x2b) \
-	X(Extension_PSKKeyExchangeModes, 0x2d) \
-	X(Extension_KeyShare,            0x33) \
-	X(Extension_QUICTransportParams, 0x39) \
-
 #define QUIC_FRAME_TYPE(X)              \
 	X(Frame_Padding,              0x00) \
 	X(Frame_Ping,                 0x01) \
@@ -134,6 +124,21 @@ enum {
 	X(Frame_ConnectionClose_QUIC, 0x1c) \
 	X(Frame_ConnectionClose_App,  0x1d) \
 	X(Frame_HandshakeDone,        0x1e)
+
+#define TLS_MESSAGE_TYPE(X)        \
+	X(Message_ClientHello,   0x01) \
+	X(Message_ServerHello,   0x02) \
+	X(Message_Handshake,     0x08)
+
+#define TLS_EXTENSION_TYPE(X)              \
+	X(Extension_ServerName,          0x00) \
+	X(Extension_SupportedGroups,     0x0a) \
+	X(Extension_SignatureAlgorithms, 0x0d) \
+	X(Extension_ALPN,                0x10) \
+	X(Extension_SupportedVersions,   0x2b) \
+	X(Extension_PSKKeyExchangeModes, 0x2d) \
+	X(Extension_KeyShare,            0x33) \
+	X(Extension_QUICTransportParams, 0x39)
 
 #define TLS_ALERT_DESC(X)                      \
 	X(Alert_CloseNotify,                    0) \
@@ -174,6 +179,10 @@ typedef enum {
 } TLS_Extension_Type;
 
 typedef enum {
+	TLS_MESSAGE_TYPE(X)
+} TLS_Message_Type;
+
+typedef enum {
 	QUIC_FRAME_TYPE(X)
 } QUIC_Frame_Type;
 
@@ -192,6 +201,12 @@ char *tls_alert_desc_to_str(TLS_Alert_Desc x) {
 char *tls_extension_type_to_str(TLS_Extension_Type x) {
 	switch (x) {
 		TLS_EXTENSION_TYPE(X)
+		default: return "(unknown)";
+	}
+}
+char *tls_message_type_to_str(TLS_Message_Type x) {
+	switch (x) {
+		TLS_MESSAGE_TYPE(X)
 		default: return "(unknown)";
 	}
 }
@@ -371,15 +386,14 @@ int build_client_hello(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	Slice s = {.data = buffer, .len = 0, .cap = buffer_size};
 
 	// TLS Client Hello
-	write_u8(&s, 0x1);
+	write_u8(&s, Message_ClientHello);
 
 	// skip the message size field for later
 	s.len += 3;
 	uint64_t msg_start = s.len;
 
 	// TLS Client Version 1.2
-	write_u8(&s, 0x3);
-	write_u8(&s, 0x3);
+	write_u16_be(&s, 0x0303);
 
 	write_data(&s, ci->client_rand, sizeof(ci->client_rand));
 
@@ -617,6 +631,43 @@ bool parse_tls_server_hello(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) 
 	return true;
 }
 
+bool parse_tls_handshake(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
+	Slice s = {.data = buffer, .len = 0, .cap = buffer_size};
+
+	uint16_t extensions_len = read_u16_be(&s);
+	uint64_t extensions_start = s.len;
+	uint64_t extensions_end = extensions_start + extensions_len;
+
+	while (s.len < extensions_end) {
+		uint16_t extension_type = read_u16_be(&s);
+		uint16_t extension_len  = read_u16_be(&s);
+		uint64_t extension_end = s.len + extension_len;
+
+		switch ((TLS_Extension_Type)extension_type) {
+			case Extension_ALPN: {
+				uint16_t protocol_data_len = read_u16_be(&s);
+				uint8_t protocol_name_len = read_u8(&s);
+
+				uint8_t *protocol_name = read_data(&s, protocol_name_len);
+			} break;
+			case Extension_QUICTransportParams: {
+				printf("transport params len: %d\n", extension_len);
+				while (s.len < extension_end) {
+					uint64_t field_type = read_varint(&s);
+					uint64_t field_len = read_varint(&s);
+					printf("0x%04llx -> 0x%04llx\n", field_type, field_len);
+					s.len += field_len;
+				}
+			} break;
+			default: {
+				printf("unhandled extension type: (%u) %s, len: %u\n", extension_type, tls_extension_type_to_str(extension_type), extension_len);
+				return false;
+			}
+		}
+	}
+	return false;
+}
+
 int build_initial_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 	if (buffer_size < 1200) { return 0; }
 
@@ -820,21 +871,30 @@ bool parse_server_frames(Conn_Info *ci, uint8_t *buffer, size_t buffer_size) {
 
 				uint64_t crypto_frame_end = crypto_frame_start + sizeof(uint32_t) + tls_msg_size;
 
-				if (tls_msg_type != 0x02) {
-					printf("unhandled TLS message!\n");
-					return false;
+				switch ((TLS_Message_Type)tls_msg_type) {
+					case Message_ServerHello: {
+						uint8_t *server_hello = pt.data + crypto_frame_start;
+						uint64_t server_hello_size = crypto_frame_end - crypto_frame_start;
+						update_sha256_sum(ci->mdctx, server_hello, server_hello_size);
+
+						uint8_t *tls_data = read_data(&pt, tls_msg_size);
+						if (!parse_tls_server_hello(ci, tls_data, tls_msg_size)) {
+							return false;
+						}
+
+						gen_handshake_keys(ci);
+					} break;
+					case Message_Handshake: {
+						uint8_t *tls_data = read_data(&pt, tls_msg_size);
+						if (!parse_tls_handshake(ci, tls_data, tls_msg_size)) {
+							return false;
+						}
+					} break;
+					default: {
+						printf("unhandled TLS message type (%x) %s!\n", tls_msg_type, tls_message_type_to_str(tls_msg_type));
+						return false;
+					}
 				}
-
-				uint8_t *server_hello = pt.data + crypto_frame_start;
-				uint64_t server_hello_size = crypto_frame_end - crypto_frame_start;
-				update_sha256_sum(ci->mdctx, server_hello, server_hello_size);
-
-				uint8_t *tls_data = read_data(&pt, tls_msg_size);
-				if (!parse_tls_server_hello(ci, tls_data, tls_msg_size)) {
-					return false;
-				}
-
-				gen_handshake_keys(ci);
 			} break;
 			default: {
 				printf("Unhandled frame type: (0x%x) %s\n", frame_type, quic_frame_type_to_str(frame_type));
