@@ -54,11 +54,17 @@ void hdkf_expand_label(uint8_t *out, size_t out_size, uint8_t key[32], char *lab
 	hdkf_expand_label_with_extra(out, out_size, key, NULL, 0, label);
 }
 
-void encrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr, size_t hdr_size) {
+void encrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint64_t seq, uint8_t aead[16], uint8_t *pkt_hdr, size_t hdr_size) {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 	EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL);
-	EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);
+
+	uint8_t nonce[12] = {};
+	memcpy(nonce, iv, 12);
+	for (int i = 0; i < 8; i++) {
+		nonce[12 - 1 - i] ^= ((seq >> (i * 8)) & 0xFF);
+	}
+	EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce);
 
 	int byte_count = 0;
 	EVP_EncryptUpdate(ctx, NULL, &byte_count, pkt_hdr, hdr_size);
@@ -106,13 +112,18 @@ void generate_shared_secret(uint8_t private_key[32], uint8_t public_key[32], uin
 	EVP_PKEY_free(pub_key);
 }
 
-bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint8_t aead[16], uint8_t *nonce, uint8_t *pkt_hdr, size_t hdr_size) {
-	//return crypto_aead_aes256gcm_decrypt_detached(out_buffer, NULL, buffer, buffer_size, aead, NULL, 0, nonce, key) == 0;
-
+bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint64_t seq, uint8_t aead[16], uint8_t *pkt_hdr, size_t hdr_size) {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 	EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL);
-	EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv);
+
+	uint8_t nonce[12] = {};
+	memcpy(nonce, iv, 12);
+	for (int i = 0; i < 8; i++) {
+		nonce[12 - 1 - i] ^= ((seq >> (i * 8)) & 0xFF);
+	}
+
+	EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce);
 
 	int byte_count = 0;
 	EVP_DecryptUpdate(ctx, NULL, &byte_count, pkt_hdr, hdr_size);
