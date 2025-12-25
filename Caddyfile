@@ -1,3 +1,9 @@
+{
+	servers {
+		protocols h3
+	}
+}
+
 localhost {
 	tls {
 		insecure_secrets_log /tmp/sslkey.log

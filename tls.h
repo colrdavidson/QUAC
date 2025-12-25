@@ -152,7 +152,17 @@ typedef struct {
 typedef enum {
 	TLS_State_Initial   = 0,
 	TLS_State_Handshake,
+	TLS_State_Application,
 } TLS_Conn_State;
+
+char *tls_conn_state_to_str(TLS_Conn_State x) {
+	switch (x) {
+		case TLS_State_Initial:     return "initial";
+		case TLS_State_Handshake:   return "handshake";
+		case TLS_State_Application: return "application";
+		default: return "(unknown)";
+	}
+}
 
 typedef struct {
 	Slice s;
@@ -189,6 +199,7 @@ char *quic_transport_param_to_str(QUIC_Transport_Param x) {
 int build_client_hello(
 		uint8_t *buffer, size_t buffer_size,
 		char *hostname, size_t hostname_len,
+		char *protocol, size_t protocol_len,
 		uint8_t *client_rand, size_t client_rand_len,
 		uint8_t *client_public_key, size_t client_public_key_len,
 		uint8_t *src_id, size_t src_id_len,
@@ -258,8 +269,8 @@ int build_client_hello(
 	// ALPN Extension
 	write_u16_be(&s, Extension_ALPN);
 
-	char alpn_data[] = "h3";
-	int alpn_data_len = sizeof(alpn_data) - 1;
+	char *alpn_data = protocol;
+	int alpn_data_len = protocol_len;
 
 	write_u16_be(&s, alpn_data_len + 3);
 	write_u16_be(&s, alpn_data_len + 1);
@@ -504,6 +515,7 @@ bool parse_tls_handshake(uint8_t *buffer, size_t buffer_size, QUIC_Transport_Par
 
 							uint8_t *stateless_reset_token = read_data(&s, field_len);
 							memcpy(params->stateless_reset_token, stateless_reset_token, 16);
+							printf("STATELESS RESET TOKEN: "); dump_flat_bytes(stateless_reset_token, 16); printf("\n");
 						} break;
 						case TransportParam_MaxUDPPayloadSize: {
 							params->max_udp_payload_size = read_varint(&s);
@@ -611,7 +623,7 @@ bool parse_tls_certificate_verify(uint8_t *buffer, size_t buffer_size) {
 
 Message_State tls_initial(
 		TLS_State *tls, uint8_t *buffer, size_t buffer_size,
-		EVP_MD_CTX *mdctx, uint8_t *server_public_key, size_t server_public_key_len,
+		EVP_MD_CTX *hello_ctx, EVP_MD_CTX *full_tls_ctx, uint8_t *server_public_key, size_t server_public_key_len,
 		uint8_t *server_rand
 	) {
 
@@ -622,7 +634,8 @@ Message_State tls_initial(
 
 	switch ((TLS_Message_Type)tls_msg_type) {
 		case Message_ServerHello: {
-			update_sha256_sum(mdctx, s.data + tls_msg_start, buffer_size);
+			update_sha256_sum(hello_ctx,    s.data + tls_msg_start, buffer_size);
+			update_sha256_sum(full_tls_ctx, s.data + tls_msg_start, buffer_size);
 
 			uint8_t *tls_data = read_data(&s, tls_msg_size);
 			if (!parse_tls_server_hello(
@@ -642,12 +655,14 @@ Message_State tls_initial(
 	return Message_Success;
 }
 
-Message_State tls_handshake(TLS_State *tls, uint8_t *buffer, size_t buffer_size, QUIC_Transport_Params *params) {
+Message_State tls_handshake(TLS_State *tls, EVP_MD_CTX *full_tls_ctx, uint8_t *buffer, size_t buffer_size, QUIC_Transport_Params *params) {
 	// Handle fragment append now
 	tls->s.cap = tls->s.len + buffer_size;
 	tls->s.data = realloc(tls->s.data, tls->s.cap);
 	memcpy(tls->s.data + tls->s.len, buffer, buffer_size);
 	tls->s.len = 0;
+
+	update_sha256_sum(full_tls_ctx, buffer, buffer_size);
 
 	Slice *s = &tls->s;
 
