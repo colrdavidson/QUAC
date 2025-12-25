@@ -112,10 +112,15 @@ void generate_shared_secret(uint8_t private_key[32], uint8_t public_key[32], uin
 	EVP_PKEY_free(pub_key);
 }
 
-bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[32], uint8_t iv[12], uint64_t seq, uint8_t aead[16], uint8_t *pkt_hdr, size_t hdr_size) {
+bool decrypt_buffer(uint8_t *out_buffer, uint8_t *buffer, size_t buffer_size, uint8_t key[16], uint8_t iv[12], uint64_t seq, uint8_t aead[16], uint8_t *pkt_hdr, size_t hdr_size) {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 	EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL);
+
+	if (DEBUG_DUMP) {
+		printf("decrypting with key: "); dump_flat_bytes(key, 16); printf(", iv: "); dump_flat_bytes(iv, 12); printf("\n");
+		printf("seq: %llu, record sample: ", seq); dump_flat_bytes(pkt_hdr, hdr_size); printf("\n");
+	}
 
 	uint8_t nonce[12] = {};
 	memcpy(nonce, iv, 12);

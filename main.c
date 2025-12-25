@@ -45,9 +45,6 @@ void dump_bytes(uint8_t *bytes, size_t len) {
 void dump_flat_bytes(uint8_t *bytes, size_t len) {
 	for (int i = 0; i < len; i++) {
 		printf("%02x", bytes[i]);
-		if (i + 1 == len) {
-			printf(" ");
-		}
 	}
 }
 
@@ -598,7 +595,7 @@ int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uin
 	bool is_long   = (pkt_hdr_byte & 0x80) >> 7;
 	bool fixed_bit = (pkt_hdr_byte & 0x40) >> 6;
 
-
+	uint8_t hdr_mask_bits = 0;
 	uint8_t payload_mask[16] = {};
 	uint64_t pkt_len = 0;
 
@@ -609,6 +606,8 @@ int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uin
 	TLS_Conn_State pkt_state;
 
 	if (is_long) {
+		hdr_mask_bits = 0x0F;
+
 		uint8_t pkt_type  = (pkt_hdr_byte & 0x30) >> 4;
 		printf("pkt %x | long-header, fixed: %u, type: (%u) %s\n", pkt_hdr_byte, fixed_bit, pkt_type, quic_packet_longtype_to_str(pkt_type));
 
@@ -645,6 +644,8 @@ int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uin
 			}
 		}
 	} else {
+		hdr_mask_bits = 0x1F;
+
 		bool spin_bit  = (pkt_hdr_byte & 0x20) >> 5;
 		printf("pkt %x | short-header, fixed: %u, spin bit: %u\n", pkt_hdr_byte, fixed_bit, spin_bit);
 
@@ -678,7 +679,7 @@ int decode_server_packet(Conn_Info *ci, uint8_t *buffer, size_t buffer_size, uin
 	generate_mask(payload_mask, sample, server_hp);
 
 	// unprotect packet header
-	s.data[0] = s.data[0] ^ (payload_mask[0] & 0x0F);
+	s.data[0] = s.data[0] ^ (payload_mask[0] & hdr_mask_bits);
 	pkt_hdr_byte = s.data[0];
 
 	uint64_t pkt_num_len = ((uint64_t)1ull) << (pkt_hdr_byte & 0x03);
@@ -985,6 +986,13 @@ bool test_handshake(void) {
 		0x57, 0xd2
 	};
 
+	uint8_t response_6[] = {
+		0x54, 0x63, 0x5f, 0x63, 0x69, 0x64, 0x95, 0x18, 0xc4, 0xa5, 0xff, 0xeb,
+		0x17, 0xb6, 0x7e, 0xc2, 0x7f, 0x97, 0xe5, 0x0d, 0x27, 0x1d, 0xc7, 0x02,
+		0xd9, 0x2c, 0xef, 0xb0, 0x68, 0x8b, 0xe9, 0xfd, 0x7b, 0x30, 0x2d, 0x9e,
+		0xb4, 0x7c, 0xdf, 0x1f, 0xc4, 0xcd, 0x9a, 0xac
+	};
+
 	uint8_t dst_id[8] = { 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7 };
 	int dst_id_len = sizeof(dst_id);
 
@@ -1007,7 +1015,7 @@ bool test_handshake(void) {
 
 	int i = 0;
 	Message_State state = Message_Failed;
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		ssize_t recv_bytes = 0;
 		uint8_t recv_buffer[1500];
 		switch (i) {
@@ -1031,8 +1039,13 @@ bool test_handshake(void) {
 				recv_bytes = sizeof(response_5);
 				memcpy(recv_buffer, response_5, recv_bytes);
 			} break;
+			case 5: {
+				recv_bytes = sizeof(response_6);
+				memcpy(recv_buffer, response_6, recv_bytes);
+			} break;
 		}
 
+		printf("DECODING PACKET\n");
 		uint8_t plaintext_buffer[1500] = {};
 		uint64_t plaintext_size = 0;
 		int ret = decode_server_packet(&ci, recv_buffer, recv_bytes, plaintext_buffer, &plaintext_size);
@@ -1053,7 +1066,7 @@ bool test_handshake(void) {
 }
 
 int main() {
-	if (true) {
+	if (false) {
 		printf("RUNNING SERVER TEST\n");
 		return test_handshake();
 	}
